@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Dome Torrent
+GenericName=BitTorrent Client
+Comment=Download and seed torrents and magnet links
+Exec=@DOME_TORRENT_DESKTOP_EXEC@ %U
+TryExec=dome-torrent
+Icon=org.domed.Torrent
+Terminal=false
+Categories=Network;FileTransfer;P2P;
+MimeType=application/x-bittorrent;x-scheme-handler/magnet;
+StartupNotify=true
+StartupWMClass=org.domed.Torrent

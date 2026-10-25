@@ -1,0 +1,222 @@
+diff --git a/docs/DESKTOP-VALIDATION.md b/docs/DESKTOP-VALIDATION.md
+index 0d05da6..466910b 100644
+--- a/docs/DESKTOP-VALIDATION.md
++++ b/docs/DESKTOP-VALIDATION.md
+@@ -249,7 +249,8 @@ Screenshots and reports are in `artifacts/gtk-menus`, `artifacts/vivaldi-menus`,
+ 
+ `scripts/test-default-apps.py` uses private XDG directories and registered fixture
+ applications to check Dome-specific MIME defaults, real `gio open` dispatch,
+-fsvr/fsx-vr detection, explicit folder overrides, incompatible/removed handlers,
++fsvr/fsx-vr detection, explicit folder overrides, torrent-file/magnet defaults,
++wrapped Dome Torrent recognition and literal URI dispatch, incompatible/removed handlers,
+ malformed preferences and write errors. It preserves other desktop defaults and
+ unrelated MIME entries. With `--compositor`, it additionally starts a private
+ D-Bus/Xvfb compositor, verifies chooser confirmation through real pointer input,
+@@ -260,7 +261,7 @@ DOME_XVFB=/path/to/Xvfb uv run --no-project --with python-xlib --with pillow pyt
+ ```
+ 
+ Backend checks can run with `python3 scripts/test-default-apps.py` alone. The
+-fixture requires a C++ compiler, Qt6 and GIO development files, and
++fixture requires a C++ compiler, de-xr FLTK and GIO development files, and
+ `update-desktop-database`. Screenshots and the report are saved under
+ `artifacts/default-apps/`.
+ 
+diff --git a/docs/WORKING_MODE_AUDIT.md b/docs/WORKING_MODE_AUDIT.md
+index c06d8a8..c438609 100644
+--- a/docs/WORKING_MODE_AUDIT.md
++++ b/docs/WORKING_MODE_AUDIT.md
+@@ -16,6 +16,7 @@ remain separate arguments, including spaces, Unicode and shell metacharacters.
+ | Dome Browser | Its global D-Bus instance can retain an XR-origin connection. The installed wrapper and desktop handler first present the existing browser window in the requested realm, then retain the browser's existing URL-forwarding/profile logic. |
+ | mpvr | Automatic playback previously selected DomeD XR whenever the headset was active. It now queries the working realm and selects the desktop socket for desktop playback. The default DomeD MIME entry no longer forces `--domed`. Explicit `--domed` and `--xr-output` choices remain available. |
+ | qimgvr and Arc SBS | Their shared image worker previously treated XR availability as an automatic presentation request. Automatic connection detection now also requires XR working mode. Explicit presenter commands remain exempt from ordinary launcher routing. |
++| Dome Torrent | The native FLTK client accepts torrent files and magnets through its canonical desktop entry. `dome-link --app-id org.domed.Torrent` presents a reused window in the requested realm before GApplication forwards the input. Separate torrent-file and magnet defaults preserve explicit choices. |
+ | Penguin Mail | D-Bus calendar/compose activation can reuse a window in the other realm. Desktop entry actions and DomeD's clock launch use the mode-aware helper before reuse. |
+ | fsvr | Native FLTK inherits its Wayland connection. Normal file handlers now select the current socket. Its explicit desktop action selects the desktop socket even when the working realm is XR. |
+ | Gmsh | Normal file opening inherits the selected socket. The separate `gmsh-dome-xr` action deliberately opens its stereo mesh view and is retained. |
+diff --git a/native/fltk_default_apps.cpp b/native/fltk_default_apps.cpp
+index f082ff2..00787fb 100644
+--- a/native/fltk_default_apps.cpp
++++ b/native/fltk_default_apps.cpp
+@@ -47,6 +47,8 @@ static const FileType types[] = {
+     {"application/zip", "ZIP archives"},
+     {"application/x-7z-compressed", "7-Zip archives"},
+     {"application/x-compressed-tar", "Compressed tar archives"},
++    {"application/x-bittorrent", "BitTorrent files (.torrent)"},
++    {"x-scheme-handler/magnet", "Magnet links"},
+     {"x-scheme-handler/https", "Web links (https)"},
+     {"x-scheme-handler/http", "Web links (http)"},
+     {"x-scheme-handler/mailto", "Email links"},
+@@ -151,6 +153,14 @@ static std::string seed(GKeyFile *file, const char *mime) {
+       if (base == "miro-pdf")
+         candidate =
+             g_str_equal(g_app_info_get_id(app), "miro-pdf.desktop") ? 0 : 1;
++    } else if (g_str_equal(mime, "application/x-bittorrent") ||
++               g_str_equal(mime, "x-scheme-handler/magnet")) {
++      // The canonical desktop entry may launch through dome-link. Its ID is
++      // stable across routing wrappers; TryExec checks the actual client.
++      if (g_str_equal(g_app_info_get_id(app), "org.domed.Torrent.desktop"))
++        candidate = 0;
++      else if (base == "dome-torrent")
++        candidate = 1;
+     } else if (base == "fsvr")
+       candidate = 0;
+     else if (base == "fsx-vr")
+@@ -185,6 +195,10 @@ extern "C" const char *dome_default_apps_list() {
+     error = seed(file, "inode/directory");
+   if (error.empty())
+     error = seed(file, "application/pdf");
++  if (error.empty())
++    error = seed(file, "application/x-bittorrent");
++  if (error.empty())
++    error = seed(file, "x-scheme-handler/magnet");
+   J rows = J::array();
+   for (auto type : types) {
+     auto apps = g_app_info_get_all_for_type(type.mime);
+diff --git a/packaging/link-handlers.json b/packaging/link-handlers.json
+index 19ebfcb..16cdb3a 100644
+--- a/packaging/link-handlers.json
++++ b/packaging/link-handlers.json
+@@ -16,6 +16,10 @@
+     "org.fsvxr.fsvr.desktop": {},
+     "info.gmsh.gmsh.desktop": {},
+     "miro-pdf.desktop": {},
++    "org.domed.Torrent.desktop": {
++      "app_id": "org.domed.Torrent",
++      "reuse": true
++    },
+     "org.domed.XNEdit.desktop": {},
+     "org.domed.FLTube.desktop": {},
+     "org.domed.Htop.desktop": {},
+diff --git a/scripts/test-default-apps.py b/scripts/test-default-apps.py
+index 0a1a055..32892ae 100644
+--- a/scripts/test-default-apps.py
++++ b/scripts/test-default-apps.py
+@@ -60,6 +60,33 @@ with tempfile.TemporaryDirectory(prefix='dome-default-apps-')as directory:
+     miro.unlink();miro_entry.unlink();subprocess.run(['update-desktop-database',str(apps)],env=env,check=True)
+     check(row('application/pdf')['current'] is None and 'application/pdf=miro-pdf.desktop;'in scoped.read_text(),'Removed Miro preserves the user choice without choosing another PDF viewer')
+     check(set_default('application/pdf','beta.desktop').returncode==0 and row('application/pdf')['current']['id']=='beta.desktop','Without Miro the user can select another registered PDF handler')
++    check(not row('application/x-bittorrent')['apps'] and not row('x-scheme-handler/magnet')['apps'],'Torrent files and magnet links are available categories without an installed handler')
++    torrent=bin_dir/'dome-torrent';torrent.write_text('#!/bin/sh\nprintf "%s\\n" dome-torrent "$@" >> '+str(journal)+'\n');torrent.chmod(0o700)
++    torrent_entry=apps/'org.domed.Torrent.desktop'
++    torrent_entry.write_text('[Desktop Entry]\nType=Application\nName=Dome Torrent\nExec=dome-torrent %U\nTryExec=dome-torrent\nMimeType=application/x-bittorrent;x-scheme-handler/magnet;\n')
++    alternative=apps/'torrent-other.desktop'
++    alternative.write_text('[Desktop Entry]\nType=Application\nName=Other Torrent\nExec=alpha %U\nMimeType=application/x-bittorrent;x-scheme-handler/magnet;\n')
++    subprocess.run(['update-desktop-database',str(apps)],env=env,check=True)
++    check(all(row(mime)['current']['id']=='org.domed.Torrent.desktop' for mime in ('application/x-bittorrent','x-scheme-handler/magnet')),'Installed Dome Torrent seeds separate torrent-file and magnet defaults')
++    torrent_file=base/'sample with spaces $literal ü.torrent'
++    torrent_file.write_bytes(b'd4:infod6:lengthi4e4:name4:test12:piece lengthi16384e6:pieces20:'+b'x'*20+b'ee')
++    magnet='magnet:?xt=urn:btih:0123456789012345678901234567890123456789&dn=literal%20name&tr=https%3A%2F%2Ftracker.invalid%2Fa'
++    journal.unlink(missing_ok=True)
++    for target in (torrent_file.as_uri(),magnet):subprocess.run(['gio','open',target],env=env,check=True)
++    wait(lambda:journal.exists() and magnet in journal.read_text() and (str(torrent_file) in journal.read_text() or torrent_file.as_uri() in journal.read_text()))
++    check(True,'gio open sends torrent paths and complete magnet arguments literally to the selected handler')
++    check(set_default('application/x-bittorrent','torrent-other.desktop').returncode==0 and row('application/x-bittorrent')['current']['id']=='torrent-other.desktop' and row('x-scheme-handler/magnet')['current']['id']=='org.domed.Torrent.desktop','Explicit torrent-file choices are preserved independently of magnet defaults')
++    before=scoped.read_bytes()
++    check(set_default('application/x-bittorrent','audio.desktop').returncode!=0 and scoped.read_bytes()==before,'Handlers without torrent MIME support are rejected')
++    check(generic.read_bytes()==original,'Torrent recommendations preserve global user defaults')
++    # Canonical desktop identity survives the active-realm launch wrapper.
++    router=bin_dir/'fixture-router';router.write_text('#!/bin/sh\nexec "$@"\n');router.chmod(0o700)
++    torrent_entry.write_text(torrent_entry.read_text().replace('Exec=dome-torrent %U','Exec=fixture-router dome-torrent %U'))
++    scoped.write_text(scoped.read_text().replace('application/x-bittorrent=torrent-other.desktop;\n','').replace('x-scheme-handler/magnet=org.domed.Torrent.desktop;\n',''))
++    subprocess.run(['update-desktop-database',str(apps)],env=env,check=True)
++    check(all(row(mime)['current']['id']=='org.domed.Torrent.desktop' for mime in ('application/x-bittorrent','x-scheme-handler/magnet')),'Dome Torrent recommendation recognizes its desktop ID after realm routing')
++    torrent.unlink();subprocess.run(['update-desktop-database',str(apps)],env=env,check=True)
++    check(all(all(app['id']!='org.domed.Torrent.desktop' for app in row(mime)['apps']) for mime in ('application/x-bittorrent','x-scheme-handler/magnet')),'TryExec hides a removed torrent client even when its routing helper remains')
+     check(generic.read_bytes()==original,'Automatic file-manager preference preserves other desktops’ defaults')
+     check({a['id']for a in row('text/plain')['apps']}=={'alpha.desktop','beta.desktop'},'Only registered handlers are offered for text files')
+     check(not row('video/x-matroska')['apps'],'File types without installed handlers report an empty choice list')
+@@ -99,6 +126,7 @@ with tempfile.TemporaryDirectory(prefix='dome-default-apps-')as directory:
+         try:
+             # Remove only these fixture choices to exercise automatic seeding in the compositor.
+             scoped.unlink();journal.unlink(missing_ok=True)
++            torrent.write_text('#!/bin/sh\nprintf "%s\\n" dome-torrent "$@" >> '+str(journal)+'\n');torrent.chmod(0o700)
+             runtime=base/'runtime';runtime.mkdir(mode=0o700)
+             rd,wr=os.pipe();start([os.environ.get('DOME_XVFB',shutil.which('Xvfb')or''),'-displayfd',str(wr),'-screen','0','1600x1000x24','-nolisten','tcp'],'xvfb',env,pass_fds=(wr,));os.close(wr)
+             with os.fdopen(rd)as pipe:display_name=':'+pipe.readline().strip()
+@@ -119,13 +147,27 @@ with tempfile.TemporaryDirectory(prefix='dome-default-apps-')as directory:
+                 g=host.get_geometry();raw=host.get_image(0,0,g.width,g.height,X.ZPixmap,0xffffffff);Image.frombytes('RGB',(g.width,g.height),raw.data,'raw','BGRX').save(out/name)
+             key('Super_L',True);key('e');key('Super_L',False)
+             wait(lambda:journal.exists()and'fsvr'in journal.read_text());check(True,'Open Files launches the detected fsvr executable in the running compositor')
+-            click(20,18);click(100,222);click(500,620);time.sleep(.4);shot('default-applications.png')
++            def open_defaults():
++                # Settings moved into a hierarchy; use its public key navigation.
++                key('Super_L',True);key('comma');key('Super_L',False)
++                time.sleep(.2);key('Home');key('Return');time.sleep(.2)
++                click(500,650);time.sleep(.4)
++            open_defaults();shot('default-applications.png')
+             click(800,172);time.sleep(.2);shot('choose-text-handler.png')
+             check('text/plain=beta.desktop;'not in scoped.read_text(),'Opening the chooser makes no change before confirmation')
+             click(600,172);click(800,656)
+             wait(lambda:'text/plain=beta.desktop;'in scoped.read_text())
+             check(row('text/plain')['current']['id']=='beta.desktop','Appearance settings picker applies the confirmed text handler')
+-            key('Escape');click(20,18);click(100,558);time.sleep(.2);click(800,128);time.sleep(.2);click(600,128);click(800,656)
++            # Scroll to the added category with the same keys as a user.
++            key('Home')
++            torrent_index=next(i for i,r in enumerate(listing()['rows']) if r['mime']=='application/x-bittorrent')
++            for _ in range(torrent_index//5):key('Next')
++            for _ in range(torrent_index%5):key('Down')
++            key('Return');time.sleep(.3);shot('choose-torrent-handler.png')
++            click(600,172);click(800,656)
++            wait(lambda:'application/x-bittorrent=torrent-other.desktop;'in scoped.read_text())
++            check(row('x-scheme-handler/magnet')['current']['id']=='org.domed.Torrent.desktop','Torrent picker applies an alternative without changing the magnet handler')
++            key('Escape');open_defaults();click(800,128);time.sleep(.2);click(600,128);click(800,656)
+             wait(lambda:'inode/directory=alpha.desktop;'in scoped.read_text())
+             key('Escape');journal.unlink(missing_ok=True)
+             key('Super_L',True);key('e');key('Super_L',False)
+diff --git a/scripts/test-link-packaging.py b/scripts/test-link-packaging.py
+index 65eca5d..a8ec56b 100644
+--- a/scripts/test-link-packaging.py
++++ b/scripts/test-link-packaging.py
+@@ -1,6 +1,7 @@
+ #!/usr/bin/python3
+ """Check launcher routing, field-code preservation and explicit-mode exceptions."""
+ import importlib.util
++import json
+ from pathlib import Path
+ import subprocess
+ import tempfile
+@@ -18,6 +19,14 @@ class Packaging(unittest.TestCase):
+         self.assertIn('Exec=gmsh-dome-xr %F',result)
+         self.assertIn('DBusActivatable=false',result)
+         self.assertEqual(module.desktop(result,{'reuse':True,'app_id':'org.domed.Fixture'}),result)
++    def test_torrent_handler_routes_reused_window_and_preserves_mime_fields(self):
++        options=json.loads((ROOT/'packaging/link-handlers.json').read_text())['applications']['org.domed.Torrent.desktop']
++        source='[Desktop Entry]\nType=Application\nName=Dome Torrent\nExec=dome-torrent %U\nTryExec=dome-torrent\nMimeType=application/x-bittorrent;x-scheme-handler/magnet;\n'
++        result=module.desktop(source,options)
++        self.assertIn('Exec=/usr/local/bin/dome-link --app-id org.domed.Torrent -- dome-torrent %U',result)
++        self.assertIn('MimeType=application/x-bittorrent;x-scheme-handler/magnet;',result)
++        self.assertIn('TryExec=dome-torrent',result)
++        self.assertEqual(module.desktop(result,options),result)
+     def test_mime_video_default_does_not_force_xr(self):
+         result=module.desktop('[Desktop Entry]\nExec=mpvr --domed %f\n',{'automatic':True})
+         self.assertEqual(result,'[Desktop Entry]\nExec=/usr/local/bin/dome-link -- mpvr %f\n')
+diff --git a/README.md b/README.md
+index 8296d66..81966e2 100644
+--- a/README.md
++++ b/README.md
+@@ -882,7 +884,7 @@ GTK introspection and Xvfb. Its report and screenshot go to that same directory.
+ 
+ **Default Applications…** is available from the system menu and the Appearance
+ pane. It covers folders, text/Markdown/JSON, PDF and Office documents, common
+-image/audio/video formats, archives, and web/email links. Select a file type,
++image/audio/video formats, archives, BitTorrent files, magnet links, and web/email links. Select a file type,
+ choose a registered application, and confirm **Use selected application**.
+ Arrow keys navigate, Enter opens/applies, Escape goes back, and the mouse wheel
+ browses the list. Refresh reloads the available handlers. Missing handlers and
+@@ -902,6 +904,16 @@ choice already exists. Without Miro, choose and install a viewer yourself in
+ Default Applications; Dome does not select a replacement. Other desktops' PDF
+ preferences are preserved.
+ 
++[Dome Torrent](https://github.com/jebot-git/dome-torrent) is the optional native FLTK BitTorrent
++client. Default Applications includes separate **BitTorrent files (.torrent)**
++and **Magnet links** choices. When installed, its canonical
++`org.domed.Torrent.desktop` entry seeds both Dome preferences unless a choice
++already exists. Explicit alternatives remain selected independently. Its
++`TryExec` hides an unavailable client, including behind the mode-routing helper.
++The launcher passes full file/magnet arguments through `dome-link`, presents an
++existing client window in the active desktop/XR realm, and forwards new input
++to that instance. Generic user MIME preferences and other desktops are preserved.
++
+ `scripts/install-miro.sh` builds and installs the native FLTK Miro fork into
+ `~/.local`, preserving the previous binary in a dated backup. Its base is upstream
+ `master` at `d35322c47d53903638558162a5e3153f32dfdc37`; the installer pins the
